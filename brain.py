@@ -1,303 +1,698 @@
-import ijson
+import copy
 import json
+import os
+import random
 import numpy as np
-import random  # Fixed: Added missing import for mutate_toggle_connection
 
+# ---------------- CONFIG ----------------
+
+MEMORY_SIZE = 5
+OUTPUT_SIZE = 3
+
+HISTORY_SIZE = MEMORY_SIZE * 2 * 3
+INPUT_SIZE = HISTORY_SIZE + 1  # +1 bias
+
+TICKS_PER_MOVE = 8
+ROUNDS_PER_MATCH = 25
+POPULATION_SIZE = 100
+MATCHES_PER_AGENT = 12
+
+MUTATION_WEIGHT_CHANCE = 0.8
+MUTATION_STRUCTURAL_CHANCE = 0.03
+ADD_CONNECTION_CHANCE = 0.08
+
+HISTORY_DECAY = 0.90
+CONFIDENCE_PENALTY_SCALE = 0.05
+RANDOM_BASELINE_MATCHES = 2
+FIXED_EVAL_POOL_SIZE = 10
+ELITE_COUNT = 5
+STATE_FILE = "save_data.json"
+
+
+# ---------------- HELPERS ----------------
+
+def sigmoid(x):
+    x = np.clip(x, -20, 20)
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def confidence_collapse(outputs):
+    if len(outputs) < 2:
+        return 0.0
+    vals = sorted(outputs, reverse=True)
+    return max(0.0, vals[0] - vals[1])
+
+
+# ---------------- GENES ----------------
 
 class NodeGene:
-    """Represents a single 'station' in the brain."""
-
     def __init__(self, node_id, node_type):
         self.id = node_id
         self.type = node_type
-        # List of (target_node_id, innovation_id)
-        self.outbound_connections = []
-
-
-class InnovationTracker:
-    def __init__(self, filename="save_data.json"):
-        self.filename = filename
-        initial_data = self.__pull_innovation_data()
-
-        if initial_data:
-            self.innovations = initial_data.get('innovation_dict', {})
-            self.current_innovation_number = initial_data.get(
-                'innovation_number', 0)
-            self.nodes = initial_data.get("nodes_dict", {})
-            self.current_node_number = initial_data.get(
-                "node_number", 0)  # Fixed: Corrected attribute name
-        else:
-            self.nodes = {}
-            self.innovations = {}
-            self.current_innovation_number = 0
-            self.current_node_number = 0  # Fixed: Corrected attribute name
-
-    def get_innovation_number(self):
-        self.current_innovation_number += 1
-        return self.current_innovation_number
-
-    def get_node_number(self):
-        self.current_node_number += 1
-        return self.current_node_number
-
-    def key_to_string(self, key):
-        return "-".join(map(str, key))
-
-    def string_to_key(self, key):
-        return tuple(map(int, key.split("-")))
-
-    def add_innovation(self, key):
-        if key not in self.innovations:
-            num = self.get_innovation_number()
-            self.innovations[key] = num
-            return num
-        return self.innovations[key]
-
-    def add_node(self, key):
-        if key not in self.nodes:
-            num = self.get_node_number()
-            self.nodes[key] = num
-            return num
-        return self.nodes[key]
-
-    def save_innovation_data(self):
-        try:
-            with open(self.filename, 'r') as f:
-                history = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            history = {}
-
-        history['innovations'] = {
-            'node_number': self.current_node_number,
-            'innovation_number': self.current_innovation_number,
-            'nodes_dict': {str(k): v for k, v in self.nodes.items()},
-            'innovation_dict': {self.key_to_string(k): v for k, v in self.innovations.items()}
-        }
-
-        with open(self.filename, 'w') as f:
-            json.dump(history, f, indent=4)
-
-    def __pull_innovation_data(self):
-        try:
-            with open(self.filename, 'rb') as f:
-                items = ijson.items(f, 'innovations')
-                innovation_data = next(items)
-        except (FileNotFoundError, StopIteration, ijson.JSONDecodeError):
-            return None
-        innovation_data['innovation_dict'] = {self.string_to_key(
-            k): v for k, v in innovation_data['innovation_dict'].items()}
-        innovation_data['nodes_dict'] = {
-            int(k): v for k, v in innovation_data['nodes_dict'].items()}
-        return innovation_data
 
 
 class Connection:
-    """Represents a single 'wire' in the brain, connecting two NodeGenes."""
-
-    def __init__(self, in_node, out_node, weight, innovation_id):
+    def __init__(self, in_node, out_node, weight, innovation_id, enabled=True):
         self.in_node = in_node
         self.out_node = out_node
         self.weight = weight
         self.innovation_id = innovation_id
-        self.enabled = True
+        self.enabled = enabled
 
-    def to_dict(self):
-        return self.__dict__
-
-
-class Genome:
-    def __init__(self, tracker, memory, input_size, output_size):
-        self.input_size = memory * input_size * 2
-        self.output_size = output_size
-        self.tracker = tracker
-        self.connections = {}
-        self.nodes = {}  # Now stores NodeGene objects
-
-        # Create Input NodeGenes
-        for i in range(self.input_size):
-            self.nodes[i] = NodeGene(i, "sensor")
-
-        # Create Output NodeGenes
-        for j in range(self.output_size):
-            output_id = self.input_size + j
-            self.nodes[output_id] = NodeGene(output_id, "output")
-
-        # Initial Full Connection
-        for i in range(self.input_size):
-            for j in range(self.output_size):
-                output_id = self.input_size + j
-                innovation_id = self.tracker.add_innovation((i, output_id))
-                self.connections[innovation_id] = Connection(
-                    i, output_id, np.random.uniform(-1, 1), innovation_id)
-
-    def mutate_add_node(self):
-        if not self.connections:
-            return
-        conn_id = np.random.choice(list(self.connections.keys()))
-        old_conn = self.connections[conn_id]
-        if not old_conn.enabled:
-            return
-        old_conn.enabled = False
-
-        new_node_id = self.tracker.add_node(old_conn.innovation_id)
-        # Add new NodeGene
-        self.nodes[new_node_id] = NodeGene(new_node_id, "hidden")
-
-        id_a = self.tracker.add_innovation((old_conn.in_node, new_node_id))
-        self.connections[id_a] = Connection(
-            old_conn.in_node, new_node_id, 1.0, id_a)
-
-        id_b = self.tracker.add_innovation((new_node_id, old_conn.out_node))
-        self.connections[id_b] = Connection(
-            new_node_id, old_conn.out_node, old_conn.weight, id_b)
-
-    def mutate_toggle_connection(self):
-        if not self.connections:
-            return
-        conn_id = random.choice(list(self.connections.keys()))
-        self.connections[conn_id].enabled ^= True
-
-    def mutate_weights(self):
-        nudge_prob = 0.8
-        reset_prob = 0.1
-        for conn in self.connections.values():
-            rand = np.random.random()
-            if rand < reset_prob:
-                conn.weight = np.random.uniform(-1, 1)
-            elif rand < (reset_prob + nudge_prob):
-                nudge = np.random.normal(0, 0.1)  # Center nudges at 0
-                conn.weight = np.clip(conn.weight + nudge, -1, 1)
+    def copy(self):
+        return Connection(
+            self.in_node,
+            self.out_node,
+            self.weight,
+            self.innovation_id,
+            self.enabled,
+        )
 
     def to_dict(self):
         return {
-            "connections": {str(k): v.to_dict() for k, v in self.connections.items()},
-            "nodes": {str(k): v.type for k, v in self.nodes.items()}
+            "in_node": self.in_node,
+            "out_node": self.out_node,
+            "weight": self.weight,
+            "innovation_id": self.innovation_id,
+            "enabled": self.enabled,
         }
 
+
+# ---------------- INNOVATION TRACKER ----------------
+
+class InnovationTracker:
+    def __init__(self):
+        self.nodes = {}
+        self.innovations = {}
+        self.current_node_number = 0
+        self.current_innovation_number = 0
+
+    def add_node(self, key):
+        key = str(key)
+        if key not in self.nodes:
+            self.current_node_number += 1
+            self.nodes[key] = self.current_node_number
+        return self.nodes[key]
+
+    def add_innovation(self, key):
+        key = str(key)
+        if key not in self.innovations:
+            self.current_innovation_number += 1
+            self.innovations[key] = self.current_innovation_number
+        return self.innovations[key]
+
+
+# ---------------- GENOME ----------------
+
+class Genome:
+    def __init__(self, tracker, initialize=True):
+        self.tracker = tracker
+        self.nodes = {}
+        self.connections = {}
+        self.sensor_ids = []
+        self.output_ids = []
+
+        if initialize:
+            for i in range(INPUT_SIZE):
+                nid = self.tracker.add_node(("input", i))
+                self.sensor_ids.append(nid)
+                self.nodes[nid] = NodeGene(nid, "sensor")
+
+            for i in range(OUTPUT_SIZE):
+                nid = self.tracker.add_node(("output", i))
+                self.output_ids.append(nid)
+                self.nodes[nid] = NodeGene(nid, "output")
+
+            for sid in self.sensor_ids:
+                for oid in self.output_ids:
+                    inv = self.tracker.add_innovation((sid, oid))
+                    self.connections[inv] = Connection(
+                        sid,
+                        oid,
+                        np.random.uniform(-1, 1),
+                        inv,
+                    )
+
+    def copy(self):
+        g = Genome(self.tracker, initialize=False)
+        g.sensor_ids = self.sensor_ids[:]
+        g.output_ids = self.output_ids[:]
+        g.nodes = {nid: NodeGene(node.id, node.type)
+                   for nid, node in self.nodes.items()}
+        g.connections = {inv: conn.copy()
+                         for inv, conn in self.connections.items()}
+        return g
+
+    def __deepcopy__(self, memo):
+        return self.copy()
+
+    def mutate(self):
+        self.mutate_weights()
+
+        if random.random() < MUTATION_STRUCTURAL_CHANCE:
+            self.mutate_add_node()
+
+        if random.random() < ADD_CONNECTION_CHANCE:
+            self.mutate_add_connection()
+
+    def mutate_weights(self):
+        for conn in self.connections.values():
+            r = random.random()
+            if r < 0.1:
+                conn.weight = np.random.uniform(-1, 1)
+            elif r < 0.9:
+                conn.weight += np.random.normal(0, 0.15)
+                conn.weight = np.clip(conn.weight, -3, 3)
+
+    def mutate_add_node(self):
+        enabled = [c for c in self.connections.values() if c.enabled]
+        if not enabled:
+            return
+
+        conn = random.choice(enabled)
+        conn.enabled = False
+
+        new_node_id = self.tracker.add_node(("hidden", conn.innovation_id))
+        if new_node_id not in self.nodes:
+            self.nodes[new_node_id] = NodeGene(new_node_id, "hidden")
+
+        inv1 = self.tracker.add_innovation((conn.in_node, new_node_id))
+        inv2 = self.tracker.add_innovation((new_node_id, conn.out_node))
+
+        self.connections[inv1] = Connection(
+            conn.in_node, new_node_id, 1.0, inv1)
+        self.connections[inv2] = Connection(
+            new_node_id, conn.out_node, conn.weight, inv2)
+
+    def mutate_add_connection(self):
+        node_ids = list(self.nodes.keys())
+        if len(node_ids) < 2:
+            return
+
+        for _ in range(50):
+            a = random.choice(node_ids)
+            b = random.choice(node_ids)
+
+            if a == b:
+                continue
+
+            a_type = self.nodes[a].type
+            b_type = self.nodes[b].type
+
+            # Sensors are input only, don't wire into them
+            if b_type == "sensor":
+                continue
+
+            # Keep output->output out for now, it tends to make things noisier
+            if a_type == "output" and b_type == "output":
+                continue
+
+            exists = False
+            for c in self.connections.values():
+                if c.in_node == a and c.out_node == b:
+                    exists = True
+                    break
+            if exists:
+                continue
+
+            inv = self.tracker.add_innovation((a, b))
+            self.connections[inv] = Connection(
+                a,
+                b,
+                np.random.uniform(-1, 1),
+                inv,
+            )
+            return
+
+
+# ---------------- AGENT ----------------
 
 class Agent:
     def __init__(self, genome, agent_id):
-        self.genome = genome
+        self.genome = genome.copy()
         self.id = agent_id
-        self.fitness = 0
+        self.fitness = 0.0
+        self.last_outputs = [0.0] * OUTPUT_SIZE
 
-        # Building the 'Live' map from the Genome
-        # Each node value now persists until you choose to clear it
+        self.runtime_connections = {}
         self.node_values = {
-            node_id: {"sum": 0.0, "output": 0.0}
-            for node_id in self.genome.nodes
+            nid: {"sum": 0.0, "output": 0.0}
+            for nid in self.genome.nodes
         }
+        self.active_nodes = set()
+        self.assemble_network()
 
-    def to_dict(self):
-        return {
-            "fitness": self.fitness,
-            "genome_data": self.genome.to_dict()
+    def assemble_network(self):
+        self.runtime_connections = {nid: [] for nid in self.genome.nodes}
+        for conn in self.genome.connections.values():
+            if conn.enabled:
+                self.runtime_connections[conn.in_node].append(
+                    (conn.out_node, conn.weight)
+                )
+
+    def reset_brain(self):
+        for nid in self.node_values:
+            self.node_values[nid]["sum"] = 0.0
+            self.node_values[nid]["output"] = 0.0
+        self.active_nodes = set()
+
+    def walk_tick(self):
+        next_active = set()
+
+        for nid in self.active_nodes:
+            output = float(self.node_values[nid]["output"])
+            for target, weight in self.runtime_connections.get(nid, []):
+                self.node_values[target]["sum"] += output * weight
+                next_active.add(target)
+
+        for nid in next_active:
+            x = self.node_values[nid]["sum"]
+            self.node_values[nid]["output"] = sigmoid(x)
+            self.node_values[nid]["sum"] = 0.0
+
+        self.active_nodes = next_active
+
+    def decide(self):
+        for _ in range(TICKS_PER_MOVE):
+            self.walk_tick()
+
+        outputs = [
+            float(self.node_values[oid]["output"])
+            for oid in self.genome.output_ids
+        ]
+        self.last_outputs = outputs[:]
+
+        max_val = max(outputs)
+        choices = [i for i, v in enumerate(outputs) if abs(v - max_val) < 1e-9]
+        return random.choice(choices)
+
+
+class RandomOpponent:
+    def __init__(self, genome_template):
+        self.genome = genome_template.copy()
+        self.id = -1
+        self.fitness = 0.0
+        self.last_outputs = [1 / 3, 1 / 3, 1 / 3]
+
+        self.node_values = {
+            nid: {"sum": 0.0, "output": 0.0}
+            for nid in self.genome.nodes
         }
+        self.active_nodes = set()
+
+    def reset_brain(self):
+        for nid in self.node_values:
+            self.node_values[nid]["sum"] = 0.0
+            self.node_values[nid]["output"] = 0.0
+        self.active_nodes = set()
+
+    def walk_tick(self):
+        return set()
+
+    def decide(self):
+        choice = random.randint(0, OUTPUT_SIZE - 1)
+        self.last_outputs = [0.0] * OUTPUT_SIZE
+        self.last_outputs[choice] = 1.0
+        return choice
 
 
-class Evaluator:
-    pass
-
-
-class Breeder:
-    pass
-
+# ---------------- SIMULATION ----------------
 
 class Simulation:
     def __init__(self):
-        self.innovation_tracker = InnovationTracker()
+        self.tracker = InnovationTracker()
+        self.generation = 0
+        self.agents = []
+        self.eval_pool = []
+
+        if not self.load_state():
+            self.agents = [
+                Agent(Genome(self.tracker), i)
+                for i in range(POPULATION_SIZE)
+            ]
+            self.eval_pool = random.sample(
+                self.agents,
+                k=min(FIXED_EVAL_POOL_SIZE, len(self.agents))
+            )
+
+    def run_match(self, a1, a2):
+        a1.reset_brain()
+        a2.reset_brain()
+
+        h1 = [0.0] * HISTORY_SIZE
+        h2 = [0.0] * HISTORY_SIZE
+
+        for _ in range(ROUNDS_PER_MATCH):
+            h1 = [x * HISTORY_DECAY for x in h1]
+            h2 = [x * HISTORY_DECAY for x in h2]
+
+            for i, val in enumerate(h1):
+                sid = a1.genome.sensor_ids[i]
+                a1.node_values[sid]["output"] = val
+
+            for i, val in enumerate(h2):
+                sid = a2.genome.sensor_ids[i]
+                a2.node_values[sid]["output"] = val
+
+            bias_index = INPUT_SIZE - 1
+            a1.node_values[a1.genome.sensor_ids[bias_index]]["output"] = 1.0
+            a2.node_values[a2.genome.sensor_ids[bias_index]]["output"] = 1.0
+
+            a1.active_nodes = set(a1.genome.sensor_ids)
+            a2.active_nodes = set(a2.genome.sensor_ids)
+
+            m1 = a1.decide()
+            m2 = a2.decide()
+
+            if m1 == m2:
+                a1.fitness += 0.1
+                a2.fitness += 0.1
+            elif (m1 - m2) % 3 == 1:
+                a1.fitness += 1.0
+                a2.fitness -= 1.0
+            else:
+                a2.fitness += 1.0
+                a1.fitness -= 1.0
+
+            a1.fitness -= confidence_collapse(a1.last_outputs) * \
+                CONFIDENCE_PENALTY_SCALE
+            a2.fitness -= confidence_collapse(a2.last_outputs) * \
+                CONFIDENCE_PENALTY_SCALE
+
+            new1 = [0.0] * 6
+            new2 = [0.0] * 6
+
+            new1[m2] = 1.0
+            new1[3 + m1] = 1.0
+
+            new2[m1] = 1.0
+            new2[3 + m2] = 1.0
+
+            h1 = h1[6:] + new1
+            h2 = h2[6:] + new2
+
+    def evaluate(self):
+        for a in self.agents:
+            a.fitness = 0.0
+
+        matchups = []
+
+        for i, agent in enumerate(self.agents):
+            possible = self.agents[i + 1:]
+            random.shuffle(possible)
+
+            for opp in possible[:MATCHES_PER_AGENT]:
+                matchups.append((agent, opp))
+
+        random.shuffle(matchups)
+
+        for a1, a2 in matchups:
+            self.run_match(a1, a2)
+
+        # Random baseline pressure
+        for agent in self.agents:
+            for _ in range(RANDOM_BASELINE_MATCHES):
+                self.run_match(agent, RandomOpponent(agent.genome))
+
+        # Tiny bloat penalty
+        for a in self.agents:
+            a.fitness -= len(a.genome.connections) * 0.001
+
+    def crossover(self, parents):
+        child = Genome(self.tracker, initialize=False)
+
+        for p in parents:
+            for nid, node in p.genome.nodes.items():
+                if nid not in child.nodes:
+                    child.nodes[nid] = NodeGene(nid, node.type)
+
+        all_innovations = set()
+        for p in parents:
+            all_innovations.update(p.genome.connections.keys())
+
+        for inv in all_innovations:
+            owners = [p for p in parents if inv in p.genome.connections]
+            chosen = random.choice(owners)
+            gene = chosen.genome.connections[inv].copy()
+
+            if any(not p.genome.connections[inv].enabled for p in owners):
+                if random.random() < 0.75:
+                    gene.enabled = False
+
+            child.connections[inv] = gene
+
+        child.sensor_ids = parents[0].genome.sensor_ids[:]
+        child.output_ids = parents[0].genome.output_ids[:]
+
+        return child
+
+    def evolve(self):
+        self.agents.sort(key=lambda a: a.fitness, reverse=True)
+        print(
+            f"Generation {self.generation} | Best: {self.agents[0].fitness:.2f}")
+
+        survivors = self.agents[: max(2, POPULATION_SIZE // 2)]
+        next_gen = []
+
+        for i, elite in enumerate(survivors[:ELITE_COUNT]):
+            next_gen.append(Agent(elite.genome, i))
+
+        while len(next_gen) < POPULATION_SIZE:
+            pool = survivors[: min(20, len(survivors))]
+            parents = random.sample(pool, 3)
+
+            child = self.crossover(parents)
+            child.mutate()
+            next_gen.append(Agent(child, len(next_gen)))
+
+        self.agents = next_gen
+        self.eval_pool = random.sample(
+            self.agents,
+            k=min(FIXED_EVAL_POOL_SIZE, len(self.agents))
+        )
+        self.generation += 1
+
+        if self.generation % 10 == 0:
+            self.save_state()
+
+    def train(self, generations):
+        for _ in range(generations):
+            self.evaluate()
+            self.evolve()
+
+    # ---------------- SAVE / LOAD ----------------
+
+    def save_state(self, path=STATE_FILE):
+        data = {
+            "generation": self.generation,
+            "tracker": {
+                "nodes": self.tracker.nodes,
+                "innovations": self.tracker.innovations,
+                "current_node_number": self.tracker.current_node_number,
+                "current_innovation_number": self.tracker.current_innovation_number,
+            },
+            "eval_pool_ids": [a.id for a in self.eval_pool],
+            "agents": []
+        }
+
+        for a in self.agents:
+            data["agents"].append({
+                "id": a.id,
+                "fitness": a.fitness,
+                "sensor_ids": a.genome.sensor_ids,
+                "output_ids": a.genome.output_ids,
+                "nodes": {
+                    str(nid): node.type
+                    for nid, node in a.genome.nodes.items()
+                },
+                "connections": [
+                    c.to_dict()
+                    for c in a.genome.connections.values()
+                ],
+            })
+
+        with open(path, "w") as f:
+            json.dump(data, f)
+
+    def load_state(self, path=STATE_FILE):
+        if not os.path.exists(path):
+            return False
+
+        with open(path, "r") as f:
+            data = json.load(f)
+
+        self.generation = data.get("generation", 0)
+
+        tracker_data = data.get("tracker", {})
+        self.tracker.nodes = tracker_data.get("nodes", {})
+        self.tracker.innovations = tracker_data.get("innovations", {})
+        self.tracker.current_node_number = tracker_data.get(
+            "current_node_number", 0)
+        self.tracker.current_innovation_number = tracker_data.get(
+            "current_innovation_number", 0)
+
+        self.agents = []
+
+        for a_data in data.get("agents", []):
+            g = Genome(self.tracker, initialize=False)
+            g.sensor_ids = a_data.get("sensor_ids", [])
+            g.output_ids = a_data.get("output_ids", [])
+
+            g.nodes = {
+                int(nid): NodeGene(int(nid), ntype)
+                for nid, ntype in a_data.get("nodes", {}).items()
+            }
+
+            g.connections = {}
+            for conn_data in a_data.get("connections", []):
+                conn = Connection(
+                    conn_data["in_node"],
+                    conn_data["out_node"],
+                    conn_data["weight"],
+                    conn_data["innovation_id"],
+                    conn_data.get("enabled", True),
+                )
+                g.connections[conn.innovation_id] = conn
+
+            agent = Agent(g, a_data.get("id", 0))
+            agent.fitness = a_data.get("fitness", 0.0)
+            self.agents.append(agent)
+
+        id_map = {a.id: a for a in self.agents}
+        eval_ids = data.get("eval_pool_ids", [])
+        self.eval_pool = [id_map[i] for i in eval_ids if i in id_map]
+
+        if not self.eval_pool and self.agents:
+            self.eval_pool = random.sample(
+                self.agents,
+                k=min(FIXED_EVAL_POOL_SIZE, len(self.agents))
+            )
+
+        return True
 
 
-class Generation:
-    def __init__(self, gen_id=None, filename="save_data.json"):
+# ---------------- LIVE PLAY ----------------
 
-        self.size = 0
-        self._agent_ids = 0
+MOVES = {
+    0: "Rock ✊",
+    1: "Paper ✋",
+    2: "Scissors ✌️",
+}
 
-        self.all_agents = {}
+INPUT_MAP = {
+    "r": 0,
+    "p": 1,
+    "s": 2,
+}
 
-        self.filename = filename
-        if gen_id is not None:
-            self.gen_id = gen_id
+
+def play_vs_ai():
+    sim = Simulation()
+
+    if not sim.agents:
+        print("No agents loaded.")
+        return
+
+    print("\n--- AI SELECTION ---")
+    print("[1] Highest Fitness Agent")
+    print("[2] Most Recent Agent")
+
+    choice = input("Selection > ").strip()
+
+    if choice == "1":
+        ai = max(sim.agents, key=lambda a: a.fitness)
+    else:
+        ai = sim.agents[-1]
+
+    print(f"\nLoaded Agent [ID: {ai.id}] [Fitness: {ai.fitness:.2f}]")
+
+    ai.reset_brain()
+
+    h_ai = [0.0] * HISTORY_SIZE
+    player_score = 0
+    ai_score = 0
+    draws = 0
+    round_num = 1
+
+    print("\n--- MATCH STARTED ---")
+    print("Type: r / p / s")
+    print("Ctrl+C to quit.\n")
+
+    try:
+        while True:
+            user_input = input(f"Round {round_num} > ").strip().lower()
+
+            if user_input not in INPUT_MAP:
+                print("Invalid input.")
+                continue
+
+            player_move = INPUT_MAP[user_input]
+
+            for i, val in enumerate(h_ai):
+                sid = ai.genome.sensor_ids[i]
+                ai.node_values[sid]["output"] = val
+
+            bias_index = INPUT_SIZE - 1
+            ai.node_values[ai.genome.sensor_ids[bias_index]]["output"] = 1.0
+
+            ai.active_nodes = set(ai.genome.sensor_ids)
+
+            ai_move = ai.decide()
+
+            print(f"\nPlayer: {MOVES[player_move]}")
+            print(f"AI:     {MOVES[ai_move]}")
+
+            if player_move == ai_move:
+                draws += 1
+                print("Result: Draw")
+            elif (player_move - ai_move) % 3 == 1:
+                player_score += 1
+                print("Result: You Win")
+            else:
+                ai_score += 1
+                print("Result: AI Wins")
+
+            print(
+                f"\nScore | You: {player_score} AI: {ai_score} Draws: {draws}")
+
+            new_entry = [0.0] * 6
+            new_entry[player_move] = 1.0
+            new_entry[3 + ai_move] = 1.0
+            h_ai = h_ai[6:] + new_entry
+
+            round_num += 1
+
+    except KeyboardInterrupt:
+        print("\n\n--- MATCH TERMINATED BY USER ---")
+        sim.save_state()
+
+
+# ---------------- MAIN ----------------
+
+if __name__ == "__main__":
+    sim = Simulation()
+
+    try:
+        user_input = input(
+            "Enter number of generations to train, 'inf' to run forever, or 'p' to play > "
+        ).strip().lower()
+
+        if user_input == "p":
+            play_vs_ai()
+
+        elif user_input == "inf":
+            while True:
+                sim.train(1)
+
+        elif user_input.isdigit():
+            sim.train(int(user_input))
+
         else:
-            self.gen_id = self.pull_generation_count()
+            print("Invalid input. Use a number, 'inf', or 'p'.")
 
-    def __getitem__(self, key):
-        return self.all_agents[key]
+    except KeyboardInterrupt:
+        print("\nStopping... saving state.")
+        sim.save_state()
 
-    def add_agents(self, agents):
-        for agent in agents:
-            self.add_agent(agent)
 
-    def add_agent(self, agent):
-        self.size += 1
-        self._agent_ids += 1
-        self.all_agents[self._agent_ids] = agent
-        agent.id = self._agent_ids
-
-    def remove_agents(self, agents):
-        for agent in agents:
-            self.remove_agent(agent)
-
-    def remove_agent(self, agent):
-        self.size -= 1
-        if agent.id not in self.all_agents:
-            return
-        else:
-            id = agent.id
-            del self.all_agents[id]
-            agent.id = None
-
-    def update_fitness(self, agent_index, reward):
-        self.all_agents[agent_index].fitness += reward
-
-    def pull_generation_count(self):
-        try:
-            with open(self.filename, "rb") as f:
-                items = ijson.items(f, "generation_count")
-                gen_count = next(items)
-        except (FileNotFoundError, StopIteration, ijson.JSONDecodeError):
-            gen_count = 0
-        return gen_count
-
-    def save_generation_count(self):
-        try:
-            with open(self.filename, 'r') as f:
-                history = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            history = {}
-
-        history['generation_count'] = self.gen_id
-
-        with open(self.filename, 'w') as f:
-            json.dump(history, f, indent=4)
-
-    def save(self, agent_ids):
-        try:
-            with open(self.filename, 'r') as f:
-                history = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            history = {}
-
-        if "agent_data" not in history:
-            history["agent_data"] = {}
-        if str(self.gen_id) not in history["agent_data"]:
-            history["agent_data"][str(self.gen_id)] = {}
-        for agent_id in agent_ids:
-            history["agent_data"][str(self.gen_id)][str(
-                agent_id)] = self.all_agents[agent_id].to_dict()
-
-        with open(self.filename, 'w') as f:
-            json.dump(history, f, indent=4)
-
-    def load(self, ids):  # the ids is a list of tuples (generation, id)
-        agents = []
-        try:
-            with open(self.filename, 'rb') as f:
-                items = ijson.items(f, "agent_data")
-                agent_data = next(items)
-        except (FileNotFoundError, StopIteration, ijson.JSONDecodeError):
-            return None
-        for id in ids:
-            agents.append(agent_data[id[0]][id[1]])
-        return agents
+# this took too long.
