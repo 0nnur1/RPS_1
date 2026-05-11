@@ -12,18 +12,22 @@ OUTPUT_SIZE = 3
 HISTORY_SIZE = MEMORY_SIZE * 2 * 3
 INPUT_SIZE = HISTORY_SIZE + 1  # +1 bias
 
-TICKS_PER_MOVE = 8
-ROUNDS_PER_MATCH = 25
+# Lower tick count reduces activation snowballing and output saturation.
+TICKS_PER_MOVE = 3
+ROUNDS_PER_MATCH = 20
 POPULATION_SIZE = 100
-MATCHES_PER_AGENT = 12
+MATCHES_PER_AGENT = 6
 
 MUTATION_WEIGHT_CHANCE = 0.8
 MUTATION_STRUCTURAL_CHANCE = 0.03
 ADD_CONNECTION_CHANCE = 0.08
 
 HISTORY_DECAY = 0.90
-CONFIDENCE_PENALTY_SCALE = 0.05
-RANDOM_BASELINE_MATCHES = 2
+CONFIDENCE_PENALTY_SCALE = 0.02
+ENTROPY_BONUS_SCALE = 0.75
+REPEAT_MOVE_PENALTY = 0.10
+
+RANDOM_BASELINE_MATCHES = 1
 FIXED_EVAL_POOL_SIZE = 10
 ELITE_COUNT = 5
 STATE_FILE = "save_data.json"
@@ -31,9 +35,24 @@ STATE_FILE = "save_data.json"
 
 # ---------------- HELPERS ----------------
 
-def sigmoid(x):
+def activate(x):
+    """
+    Tanh keeps activations centered around 0 and avoids sigmoid's one-way drift.
+    """
     x = np.clip(x, -20, 20)
-    return 1.0 / (1.0 + np.exp(-x))
+    return np.tanh(x)
+
+
+def softmax(values, temperature=1.0):
+    vals = np.array(values, dtype=float)
+    temperature = max(1e-6, float(temperature))
+    vals = vals / temperature
+    vals = vals - np.max(vals)
+    exps = np.exp(vals)
+    total = np.sum(exps)
+    if total <= 0 or not np.isfinite(total):
+        return np.ones(len(values), dtype=float) / max(1, len(values))
+    return exps / total
 
 
 def confidence_collapse(outputs):
@@ -41,6 +60,19 @@ def confidence_collapse(outputs):
         return 0.0
     vals = sorted(outputs, reverse=True)
     return max(0.0, vals[0] - vals[1])
+
+
+def normalized_entropy(counts):
+    total = sum(counts)
+    if total <= 0:
+        return 0.0
+
+    probs = [c / total for c in counts if c > 0]
+    if len(probs) <= 1:
+        return 0.0
+
+    h = -sum(p * np.log(p) for p in probs)
+    return float(h / np.log(len(counts)))
 
 
 # ---------------- GENES ----------------
@@ -72,7 +104,7 @@ class Connection:
         return {
             "in_node": self.in_node,
             "out_node": self.out_node,
-            "weight": self.weight,
+            "weight": float(self.weight),
             "innovation_id": self.innovation_id,
             "enabled": self.enabled,
         }
@@ -137,10 +169,14 @@ class Genome:
         g = Genome(self.tracker, initialize=False)
         g.sensor_ids = self.sensor_ids[:]
         g.output_ids = self.output_ids[:]
-        g.nodes = {nid: NodeGene(node.id, node.type)
-                   for nid, node in self.nodes.items()}
-        g.connections = {inv: conn.copy()
-                         for inv, conn in self.connections.items()}
+        g.nodes = {
+            nid: NodeGene(node.id, node.type)
+            for nid, node in self.nodes.items()
+        }
+        g.connections = {
+            inv: conn.copy()
+            for inv, conn in self.connections.items()
+        }
         return g
 
     def __deepcopy__(self, memo):
@@ -180,9 +216,11 @@ class Genome:
         inv2 = self.tracker.add_innovation((new_node_id, conn.out_node))
 
         self.connections[inv1] = Connection(
-            conn.in_node, new_node_id, 1.0, inv1)
+            conn.in_node, new_node_id, 1.0, inv1
+        )
         self.connections[inv2] = Connection(
-            new_node_id, conn.out_node, conn.weight, inv2)
+            new_node_id, conn.out_node, conn.weight, inv2
+        )
 
     def mutate_add_connection(self):
         node_ids = list(self.nodes.keys())
@@ -199,11 +237,9 @@ class Genome:
             a_type = self.nodes[a].type
             b_type = self.nodes[b].type
 
-            # Sensors are input only, don't wire into them
             if b_type == "sensor":
                 continue
 
-            # Keep output->output out for now, it tends to make things noisier
             if a_type == "output" and b_type == "output":
                 continue
 
@@ -212,6 +248,7 @@ class Genome:
                 if c.in_node == a and c.out_node == b:
                     exists = True
                     break
+
             if exists:
                 continue
 
@@ -265,9 +302,15 @@ class Agent:
                 self.node_values[target]["sum"] += output * weight
                 next_active.add(target)
 
+        # Clear stale outputs for non-sensor nodes that were not activated.
+        # This prevents one lucky move from sticking forever.
+        for nid in self.node_values:
+            if nid not in next_active and self.genome.nodes[nid].type != "sensor":
+                self.node_values[nid]["output"] = 0.0
+
         for nid in next_active:
             x = self.node_values[nid]["sum"]
-            self.node_values[nid]["output"] = sigmoid(x)
+            self.node_values[nid]["output"] = activate(x)
             self.node_values[nid]["sum"] = 0.0
 
         self.active_nodes = next_active
@@ -282,9 +325,8 @@ class Agent:
         ]
         self.last_outputs = outputs[:]
 
-        max_val = max(outputs)
-        choices = [i for i, v in enumerate(outputs) if abs(v - max_val) < 1e-9]
-        return random.choice(choices)
+        probs = softmax(outputs, temperature=1.0)
+        return int(np.random.choice(len(outputs), p=probs))
 
 
 class RandomOpponent:
@@ -330,17 +372,38 @@ class Simulation:
                 Agent(Genome(self.tracker), i)
                 for i in range(POPULATION_SIZE)
             ]
-            self.eval_pool = random.sample(
-                self.agents,
-                k=min(FIXED_EVAL_POOL_SIZE, len(self.agents))
-            )
+            self.refresh_eval_pool()
+
+    def refresh_eval_pool(self):
+        if not self.agents:
+            self.eval_pool = []
+            return
+        self.eval_pool = random.sample(
+            self.agents,
+            k=min(FIXED_EVAL_POOL_SIZE, len(self.agents))
+        )
 
     def run_match(self, a1, a2):
+        """
+        Returns fitness deltas for both participants.
+        This avoids mutating shared agent state during evaluation.
+        """
         a1.reset_brain()
         a2.reset_brain()
 
         h1 = [0.0] * HISTORY_SIZE
         h2 = [0.0] * HISTORY_SIZE
+
+        move_counts_1 = [0, 0, 0]
+        move_counts_2 = [0, 0, 0]
+
+        last_move_1 = None
+        last_move_2 = None
+        repeat_streak_1 = 0
+        repeat_streak_2 = 0
+
+        fitness_1 = 0.0
+        fitness_2 = 0.0
 
         for _ in range(ROUNDS_PER_MATCH):
             h1 = [x * HISTORY_DECAY for x in h1]
@@ -364,20 +427,40 @@ class Simulation:
             m1 = a1.decide()
             m2 = a2.decide()
 
-            if m1 == m2:
-                a1.fitness += 0.1
-                a2.fitness += 0.1
-            elif (m1 - m2) % 3 == 1:
-                a1.fitness += 1.0
-                a2.fitness -= 1.0
-            else:
-                a2.fitness += 1.0
-                a1.fitness -= 1.0
+            move_counts_1[m1] += 1
+            move_counts_2[m2] += 1
 
-            a1.fitness -= confidence_collapse(a1.last_outputs) * \
+            if m1 == last_move_1:
+                repeat_streak_1 += 1
+            else:
+                repeat_streak_1 = 1
+            last_move_1 = m1
+
+            if m2 == last_move_2:
+                repeat_streak_2 += 1
+            else:
+                repeat_streak_2 = 1
+            last_move_2 = m2
+
+            if m1 == m2:
+                fitness_1 += 0.1
+                fitness_2 += 0.1
+            elif (m1 - m2) % 3 == 1:
+                fitness_1 += 1.0
+                fitness_2 -= 1.0
+            else:
+                fitness_2 += 1.0
+                fitness_1 -= 1.0
+
+            fitness_1 -= confidence_collapse(a1.last_outputs) * \
                 CONFIDENCE_PENALTY_SCALE
-            a2.fitness -= confidence_collapse(a2.last_outputs) * \
+            fitness_2 -= confidence_collapse(a2.last_outputs) * \
                 CONFIDENCE_PENALTY_SCALE
+
+            if repeat_streak_1 > 2:
+                fitness_1 -= REPEAT_MOVE_PENALTY
+            if repeat_streak_2 > 2:
+                fitness_2 -= REPEAT_MOVE_PENALTY
 
             new1 = [0.0] * 6
             new2 = [0.0] * 6
@@ -391,32 +474,49 @@ class Simulation:
             h1 = h1[6:] + new1
             h2 = h2[6:] + new2
 
+        fitness_1 += ENTROPY_BONUS_SCALE * normalized_entropy(move_counts_1)
+        fitness_2 += ENTROPY_BONUS_SCALE * normalized_entropy(move_counts_2)
+
+        return fitness_1, fitness_2
+
     def evaluate(self):
-        for a in self.agents:
-            a.fitness = 0.0
+        # Evaluate everyone fresh.
+        fitness_deltas = {a: 0.0 for a in self.agents}
 
-        matchups = []
-
-        for i, agent in enumerate(self.agents):
-            possible = self.agents[i + 1:]
-            random.shuffle(possible)
-
-            for opp in possible[:MATCHES_PER_AGENT]:
-                matchups.append((agent, opp))
-
-        random.shuffle(matchups)
-
-        for a1, a2 in matchups:
-            self.run_match(a1, a2)
-
-        # Random baseline pressure
         for agent in self.agents:
-            for _ in range(RANDOM_BASELINE_MATCHES):
-                self.run_match(agent, RandomOpponent(agent.genome))
+            fixed_opps = [opp for opp in self.eval_pool if opp is not agent]
+            random.shuffle(fixed_opps)
 
-        # Tiny bloat penalty
+            chosen = fixed_opps[: min(2, len(fixed_opps))]
+            remaining = MATCHES_PER_AGENT - len(chosen)
+
+            random_pool = [
+                a for a in self.agents
+                if a is not agent and a not in chosen
+            ]
+
+            if remaining > 0 and random_pool:
+                chosen.extend(
+                    random.sample(
+                        random_pool,
+                        k=min(remaining, len(random_pool))
+                    )
+                )
+
+            for opp in chosen:
+                d1, d2 = self.run_match(agent, opp)
+                fitness_deltas[agent] += d1
+                fitness_deltas[opp] += d2
+
+            for _ in range(RANDOM_BASELINE_MATCHES):
+                d1, _ = self.run_match(agent, RandomOpponent(agent.genome))
+                fitness_deltas[agent] += d1
+
         for a in self.agents:
-            a.fitness -= len(a.genome.connections) * 0.001
+            fitness_deltas[a] -= len(a.genome.connections) * 0.001
+
+        for a in self.agents:
+            a.fitness = fitness_deltas[a]
 
     def crossover(self, parents):
         child = Genome(self.tracker, initialize=False)
@@ -425,6 +525,13 @@ class Simulation:
             for nid, node in p.genome.nodes.items():
                 if nid not in child.nodes:
                     child.nodes[nid] = NodeGene(nid, node.type)
+
+        for nid in parents[0].genome.sensor_ids:
+            if nid not in child.nodes:
+                child.nodes[nid] = NodeGene(nid, "sensor")
+        for nid in parents[0].genome.output_ids:
+            if nid not in child.nodes:
+                child.nodes[nid] = NodeGene(nid, "output")
 
         all_innovations = set()
         for p in parents:
@@ -459,17 +566,17 @@ class Simulation:
 
         while len(next_gen) < POPULATION_SIZE:
             pool = survivors[: min(20, len(survivors))]
-            parents = random.sample(pool, 3)
+            if len(pool) >= 3:
+                parents = random.sample(pool, 3)
+            else:
+                parents = [random.choice(pool)] * 3
 
             child = self.crossover(parents)
             child.mutate()
             next_gen.append(Agent(child, len(next_gen)))
 
         self.agents = next_gen
-        self.eval_pool = random.sample(
-            self.agents,
-            k=min(FIXED_EVAL_POOL_SIZE, len(self.agents))
-        )
+        self.refresh_eval_pool()
         self.generation += 1
 
         if self.generation % 10 == 0:
@@ -548,7 +655,7 @@ class Simulation:
                 conn = Connection(
                     conn_data["in_node"],
                     conn_data["out_node"],
-                    conn_data["weight"],
+                    float(conn_data["weight"]),
                     conn_data["innovation_id"],
                     conn_data.get("enabled", True),
                 )
@@ -563,10 +670,7 @@ class Simulation:
         self.eval_pool = [id_map[i] for i in eval_ids if i in id_map]
 
         if not self.eval_pool and self.agents:
-            self.eval_pool = random.sample(
-                self.agents,
-                k=min(FIXED_EVAL_POOL_SIZE, len(self.agents))
-            )
+            self.refresh_eval_pool()
 
         return True
 
@@ -693,6 +797,3 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nStopping... saving state.")
         sim.save_state()
-
-
-# this took too long.
